@@ -1,0 +1,89 @@
+// Drishtec - ESP32: HC-SR04 + buzzer, range 5 cm to 30 cm
+// Closer obstacle = faster beeps. Outside range = silence.
+//
+// Wiring (GPIO numbers):
+//   HC-SR04 VCC  -> 5V (VIN)        HC-SR04 GND -> GND
+//   HC-SR04 TRIG -> GPIO 5
+//   HC-SR04 ECHO -> GPIO 18 (through voltage divider: 1k series + 2k to GND)
+//   Buzzer (+)   -> GPIO 19         Buzzer (-)  -> GND
+//
+// Needs arduino-esp32 core 3.x (tone() support).
+
+const int TRIG_PIN   = 5;
+const int ECHO_PIN   = 18;
+const int BUZZER_PIN = 19;
+
+const float MIN_CM = 5.0;
+const float MAX_CM = 30.0;
+
+const int BEEP_FREQ_HZ   = 2000;  // pitch of each beep
+const int BEEP_LENGTH_MS = 100;   // length of each beep
+const int FASTEST_GAP_MS = 300;   // time between beep starts at 5 cm
+const int SLOWEST_GAP_MS = 1500;  // time between beep starts at 30 cm
+
+const unsigned long PING_EVERY_MS   = 50;
+const unsigned long ECHO_TIMEOUT_US = 3500;  // ~60 cm max, ignores far echoes
+const int NEEDED = 2;                        // consecutive valid readings before beeping
+
+unsigned long lastPing = 0;
+unsigned long lastBeep = 0;
+float distanceCm = -1;   // -1 = nothing in range
+int validStreak = 0;
+
+float readOnce() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return -1;
+
+  float cm = duration * 0.0343 / 2.0;
+  return (cm < MIN_CM || cm > MAX_CM) ? -1 : cm;
+}
+
+float readDistanceCm() {
+  float r[3];
+  for (int i = 0; i < 3; i++) { r[i] = readOnce(); delay(5); }
+
+  // median of 3
+  if (r[0] > r[1]) { float t = r[0]; r[0] = r[1]; r[1] = t; }
+  if (r[1] > r[2]) { float t = r[1]; r[1] = r[2]; r[2] = t; }
+  if (r[0] > r[1]) { float t = r[0]; r[0] = r[1]; r[1] = t; }
+  float m = r[1];
+
+  if (m > 0) validStreak++; else validStreak = 0;
+  return (validStreak >= NEEDED) ? m : -1;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1. New distance reading on schedule
+  if (now - lastPing >= PING_EVERY_MS) {
+    lastPing = now;
+    distanceCm = readDistanceCm();
+    Serial.println(distanceCm);
+  }
+
+  // 2. Closer = shorter gap = faster beeps (non-blocking)
+  if (distanceCm > 0) {
+    float ratio = (distanceCm - MIN_CM) / (MAX_CM - MIN_CM);  // 0 at 5 cm, 1 at 30 cm
+    ratio = constrain(ratio, 0.0, 1.0);
+    unsigned long gap = FASTEST_GAP_MS + ratio * (SLOWEST_GAP_MS - FASTEST_GAP_MS);
+
+    if (now - lastBeep >= gap) {
+      lastBeep = now;
+      tone(BUZZER_PIN, BEEP_FREQ_HZ, BEEP_LENGTH_MS);
+    }
+  }
+}
