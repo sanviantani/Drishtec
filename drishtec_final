@@ -1,0 +1,227 @@
+/*
+ * ============================================================
+ *  DRISHTEC - Wearable Obstacle Alert Cap
+ *  Seva First Innovation Challenge
+ * ============================================================
+ *  Two ultrasonic sensors (LEFT and RIGHT) sit on the cap brim.
+ *  Each sensor has its own buzzer. When an object, such as a hand,
+ *  comes within range, that side beeps. The closer the object,
+ *  the faster and higher the beeps.
+ *
+ *  Two LEDs (both connected to pin 6):
+ *    - system ON, nothing detected  -> LEDs stay steadily ON
+ *    - object detected              -> LEDs BLINK
+ *  The blink speed depends on the NEAREST object (left or right).
+ *
+ *    Zone     Distance     Sound                    LEDs
+ *    CLEAR    nothing      silent                   steady ON
+ *    AHEAD    30 - 50 cm   slow, low beeps          slow blink
+ *    CLOSE    15 - 30 cm   fast, medium beeps       fast blink
+ *    DANGER    5 - 15 cm   very fast, high beeps    very fast blink
+ *
+ *  The RIGHT buzzer sounds 500 Hz higher than the LEFT one, so the
+ *  wearer can tell which side the object is on.
+ *
+ *  Board  : Arduino Uno
+ *  Sensors: 2 x HC-SR04      Buzzers: 2 x passive buzzer
+ *  LEDs   : 2 x 5 V 20 mA LED, each with its OWN 330 ohm resistor
+ *           pin 6 -> 330 ohm -> LED 1 long leg, LED 1 short leg -> GND
+ *           pin 6 -> 330 ohm -> LED 2 long leg, LED 2 short leg -> GND
+ * ============================================================
+ */
+
+/* ---------- Pin connections (change here if your wiring differs) ---------- */
+#define LEFT   0
+#define RIGHT  1
+
+int trigPin[2]   = {9, 11};     /* LEFT, RIGHT */
+int echoPin[2]   = {10, 12};
+int buzzerPin[2] = {8, 7};
+
+#define LED_PIN  6              /* both LEDs (each with its own resistor) */
+
+/* ---------- Detection range ---------- */
+#define MIN_CM        2
+#define MAX_CM        20
+#define CLOSE_CM      12       /* below this: CLOSE zone  */
+#define DANGER_CM     8       /* below this: DANGER zone */
+
+/* An object counts as "detected" only after this many readings in a row
+   are inside the range. This stops a single false echo from making the
+   LEDs or buzzer react. Use 1 for the fastest reaction. */
+#define CONFIRM_HITS  2
+
+/* ---------- Timing ---------- */
+#define PING_GAP_MS      60     /* quiet time between pings of different sensors */
+#define PING_TIMEOUT_US  5000   /* stop waiting for an echo after about 85 cm    */
+
+/* ---------- Sounds: one entry per zone ---------- */
+#define ZONE_CLEAR   0
+#define ZONE_AHEAD   1
+#define ZONE_CLOSE   2
+#define ZONE_DANGER  3
+
+const char *zoneName[4]   = {"CLEAR", "AHEAD", "CLOSE", "DANGER"};
+int zonePitchHz[4]        = {0, 1000, 1500, 2000};
+int zoneBeepMs[4]         = {0, 80, 60, 70};
+int zonePeriodMs[4]       = {0, 480, 160, 100};
+int sidePitchShiftHz[2]   = {0, 500};
+
+/* ---------- LED blink: one entry per zone ---------- */
+int ledOnMs[4]            = {0, 100, 60, 40};     /* how long the LEDs stay on   */
+int ledPeriodMs[4]        = {0, 600, 250, 100};   /* time from one blink to next */
+
+/* ---------- Program state ---------- */
+float         distanceCm[2] = {-1, -1};   /* latest reading of each sensor */
+int           hitCount[2]   = {0, 0};     /* readings in a row inside range */
+unsigned long nextBeepAt[2] = {0, 0};     /* when each side may beep again */
+unsigned long toneEndsAt    = 0;          /* the Uno plays one tone at a time */
+unsigned long ledOffAt      = 0;          /* when the LEDs should switch off */
+unsigned long ledNextAt     = 0;          /* when the LEDs may blink again */
+unsigned long lastPingAt    = 0;
+int           sensorTurn    = LEFT;       /* which sensor pings next */
+
+
+/* Measure distance in cm with one sensor. Returns -1 if no echo. */
+float readDistanceCm(int side) {
+  long echoMicros;
+
+  digitalWrite(trigPin[side], LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin[side], HIGH);      /* 10 microsecond trigger pulse */
+  delayMicroseconds(10);
+  digitalWrite(trigPin[side], LOW);
+
+  echoMicros = pulseIn(echoPin[side], HIGH, PING_TIMEOUT_US);
+  if (echoMicros == 0) {
+    return -1;
+  }
+
+  /* sound travels 0.0343 cm per microsecond, there and back */
+  return echoMicros * 0.0343 / 2;
+}
+
+
+/* Decide which zone a distance falls into. */
+int zoneFor(float cm) {
+  if (cm < MIN_CM || cm > MAX_CM) return ZONE_CLEAR;
+  if (cm < DANGER_CM)             return ZONE_DANGER;
+  if (cm < CLOSE_CM)              return ZONE_CLOSE;
+  return ZONE_AHEAD;
+}
+
+
+/* The zone of one side, but only once the object has been confirmed.
+   Until then the side counts as CLEAR (no beep, LEDs steady). */
+int activeZone(int side) {
+  if (hitCount[side] < CONFIRM_HITS) return ZONE_CLEAR;
+  return zoneFor(distanceCm[side]);
+}
+
+
+/* Print one line to the Serial Monitor, e.g.  LEFT  |  32.4 cm | AHEAD */
+void report(int side, float cm, int zone) {
+  Serial.print(side == LEFT ? "LEFT  | " : "RIGHT | ");
+  if (cm < 0) {
+    Serial.print("  --   cm | ");
+  } else {
+    Serial.print(cm, 1);
+    Serial.print(" cm | ");
+  }
+  Serial.println(zoneName[zone]);
+}
+
+
+/* Play a short beep for this side if its next beep is due. */
+void beepIfDue(int side, int zone, unsigned long now) {
+  if (zone == ZONE_CLEAR) return;
+  if ((long)(now - nextBeepAt[side]) < 0) return;   /* not due yet        */
+  if ((long)(now - toneEndsAt) < 0) return;         /* another tone is on */
+
+  tone(buzzerPin[side], zonePitchHz[zone] + sidePitchShiftHz[side],
+       zoneBeepMs[zone]);
+  toneEndsAt        = now + zoneBeepMs[zone] + 5;
+  nextBeepAt[side]  = now + zonePeriodMs[zone];
+}
+
+
+/* LEDs: steady ON when nothing is detected, BLINK when an object is detected.
+   The nearer the closest object, the faster the blink. */
+void updateLed(int zone, unsigned long now) {
+  if (zone == ZONE_CLEAR) {                         /* nothing detected */
+    digitalWrite(LED_PIN, HIGH);                    /* LEDs steady ON   */
+    ledNextAt = 0;                                  /* start blinking at once next time */
+    return;
+  }
+
+  if ((long)(now - ledNextAt) >= 0) {               /* time for a new blink */
+    digitalWrite(LED_PIN, HIGH);
+    ledOffAt  = now + ledOnMs[zone];
+    ledNextAt = now + ledPeriodMs[zone];
+  }
+
+  if ((long)(now - ledOffAt) >= 0) {                /* blink is over: dark gap */
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+
+void setup(void) {
+  int side;
+
+  Serial.begin(9600);
+  Serial.println("=== DRISHTEC obstacle alert cap ===");
+  Serial.println("Hold your hand 5 - 50 cm in front of a sensor.");
+
+  for (side = LEFT; side <= RIGHT; side++) {
+    pinMode(trigPin[side], OUTPUT);
+    pinMode(echoPin[side], INPUT);
+    pinMode(buzzerPin[side], OUTPUT);
+  }
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);                      /* LEDs ON as soon as the system starts */
+
+  /* start-up self-test: LEFT beeps, then RIGHT (the LEDs stay on) */
+  for (side = LEFT; side <= RIGHT; side++) {
+    tone(buzzerPin[side], 1500 + sidePitchShiftHz[side], 150);
+    delay(300);
+  }
+}
+
+
+void loop(void) {
+  unsigned long now;
+  int zone;
+  int leftZone, rightZone, nearestZone;
+
+  /* 1. Take turns pinging, one sensor every PING_GAP_MS */
+  now = millis();
+  if (now - lastPingAt >= PING_GAP_MS) {
+    lastPingAt = now;
+    distanceCm[sensorTurn] = readDistanceCm(sensorTurn);
+    zone = zoneFor(distanceCm[sensorTurn]);
+
+    /* count readings in a row that are inside the range */
+    if (zone == ZONE_CLEAR) {
+      hitCount[sensorTurn] = 0;
+    } else if (hitCount[sensorTurn] < CONFIRM_HITS) {
+      hitCount[sensorTurn]++;
+    }
+
+    report(sensorTurn, distanceCm[sensorTurn], zone);
+    sensorTurn = (sensorTurn == LEFT) ? RIGHT : LEFT;
+  }
+
+  /* 2. Find the confirmed zone of each side, and the nearest of the two */
+  leftZone  = activeZone(LEFT);
+  rightZone = activeZone(RIGHT);
+  nearestZone = (leftZone > rightZone) ? leftZone : rightZone;
+
+  /* 3. Beep for each side that has a confirmed object in range */
+  now = millis();
+  beepIfDue(LEFT,  leftZone,  now);
+  beepIfDue(RIGHT, rightZone, now);
+
+  /* 4. LEDs: steady ON when clear, blink when an object is detected */
+  updateLed(nearestZone, now);
+}
