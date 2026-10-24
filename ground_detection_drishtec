@@ -1,0 +1,248 @@
+n[2]   = {9, 11};     /* LEFT, RIGHT */
+int echoPin[2]   = {10, 12};
+int buzzerPin[2] = {8, 7};
+
+#define LED_PIN  6
+
+/* ---------- Detection range ---------- */
+#define MIN_CM        2
+#define MAX_CM        20
+#define CLOSE_CM      12       /* below this: CLOSE zone  */
+#define DANGER_CM     8        /* /*
+ * ============================================================
+ *  DRISHTEC - Wearable Obstacle Alert Cap (with calibration)
+ *  Seva First Innovation Challenge
+ * ============================================================
+ *  Start-up : LED BLINKS for 5 seconds while the cap measures the
+ *             ground distance in front of each sensor.
+ *  Running  : nothing detected -> LED OFF
+ *             object detected  -> LED STEADY ON + buzzer on that side
+ *  An object is anything closer than the ground distance
+ *  (minus GROUND_MARGIN_CM), inside the zone range below.
+ *
+ *  Board  : Arduino Uno
+ *  Sensors: 2 x HC-SR04      Buzzers: 2 x passive buzzer
+ *  LEDs   : 2 LEDs on pin 6, each with its OWN 330 ohm resistor
+ * ============================================================
+ */
+
+/* ---------- Pin connections ---------- */
+#define LEFT   0
+#define RIGHT  1
+
+int trigPibelow this: DANGER zone */
+#define CONFIRM_HITS  2
+
+/* ---------- Calibration ---------- */
+#define CALIBRATE_MS     5000   /* calibration time                          */
+#define CAL_BLINK_MS     150    /* LED blink speed while calibrating         */
+#define GROUND_MARGIN_CM 5      /* object must be this much closer than ground */
+#define NO_ECHO_GROUND   100    /* ground value if no echo came back at all  */
+
+/* ---------- Timing ---------- */
+#define PING_GAP_MS      60
+#define PING_TIMEOUT_US  5000
+
+/* ---------- Sounds: one entry per zone ---------- */
+#define ZONE_CLEAR   0
+#define ZONE_AHEAD   1
+#define ZONE_CLOSE   2
+#define ZONE_DANGER  3
+
+const char *zoneName[4]   = {"CLEAR", "AHEAD", "CLOSE", "DANGER"};
+int zonePitchHz[4]        = {0, 1000, 1500, 2000};
+int zoneBeepMs[4]         = {0, 80, 60, 70};
+int zonePeriodMs[4]       = {0, 480, 160, 100};
+int sidePitchShiftHz[2]   = {0, 500};
+
+/* ---------- Program state ---------- */
+float         groundCm[2]   = {NO_ECHO_GROUND, NO_ECHO_GROUND};  /* from calibration */
+float         distanceCm[2] = {-1, -1};
+int           hitCount[2]   = {0, 0};
+unsigned long nextBeepAt[2] = {0, 0};
+unsigned long toneEndsAt    = 0;
+unsigned long lastPingAt    = 0;
+int           sensorTurn    = LEFT;
+
+
+/* Measure distance in cm with one sensor. Returns -1 if no echo. */
+float readDistanceCm(int side) {
+  long echoMicros;
+
+  digitalWrite(trigPin[side], LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin[side], HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin[side], LOW);
+
+  echoMicros = pulseIn(echoPin[side], HIGH, PING_TIMEOUT_US);
+  if (echoMicros == 0) {
+    return -1;
+  }
+  return echoMicros * 0.0343 / 2;
+}
+
+
+/* Calibrate: blink the LED for CALIBRATE_MS and average the ground distance. */
+void calibrateGround(void) {
+  unsigned long start, now;
+  unsigned long lastPing = 0;
+  unsigned long lastBlink = 0;
+  int  turn = LEFT;
+  int  side;
+  int  ledState = HIGH;
+  float sum[2]   = {0, 0};
+  int   count[2] = {0, 0};
+  float cm;
+
+  Serial.println("Calibrating ground... keep the area in front clear.");
+  start = millis();
+  digitalWrite(LED_PIN, ledState);
+
+  while (millis() - start < CALIBRATE_MS) {
+    now = millis();
+
+    /* blink the LED */
+    if (now - lastBlink >= CAL_BLINK_MS) {
+      lastBlink = now;
+      ledState = (ledState == HIGH) ? LOW : HIGH;
+      digitalWrite(LED_PIN, ledState);
+    }
+
+    /* ping the sensors in turn and collect valid readings */
+    if (now - lastPing >= PING_GAP_MS) {
+      lastPing = now;
+      cm = readDistanceCm(turn);
+      if (cm >= MIN_CM) {
+        sum[turn] += cm;
+        count[turn]++;
+      }
+      turn = (turn == LEFT) ? RIGHT : LEFT;
+    }
+  }
+
+  for (side = LEFT; side <= RIGHT; side++) {
+    if (count[side] > 0) {
+      groundCm[side] = sum[side] / count[side];
+    } else {
+      groundCm[side] = NO_ECHO_GROUND;     /* no echo: ground is out of reach */
+    }
+    Serial.print(side == LEFT ? "LEFT  ground = " : "RIGHT ground = ");
+    Serial.print(groundCm[side], 1);
+    Serial.println(" cm");
+  }
+
+  digitalWrite(LED_PIN, LOW);               /* calibration done, LED off */
+  Serial.println("Calibration done.");
+}
+
+
+/* Decide the zone. Anything not clearly closer than the ground is CLEAR. */
+int zoneFor(float cm, int side) {
+  if (cm < MIN_CM || cm > MAX_CM)                  return ZONE_CLEAR;
+  if (cm > groundCm[side] - GROUND_MARGIN_CM)      return ZONE_CLEAR;  /* it is the ground */
+  if (cm < DANGER_CM)                              return ZONE_DANGER;
+  if (cm < CLOSE_CM)                               return ZONE_CLOSE;
+  return ZONE_AHEAD;
+}
+
+
+int activeZone(int side) {
+  if (hitCount[side] < CONFIRM_HITS) return ZONE_CLEAR;
+  return zoneFor(distanceCm[side], side);
+}
+
+
+void report(int side, float cm, int zone) {
+  Serial.print(side == LEFT ? "LEFT  | " : "RIGHT | ");
+  if (cm < 0) {
+    Serial.print("  --   cm | ");
+  } else {
+    Serial.print(cm, 1);
+    Serial.print(" cm | ");
+  }
+  Serial.println(zoneName[zone]);
+}
+
+
+void beepIfDue(int side, int zone, unsigned long now) {
+  if (zone == ZONE_CLEAR) return;
+  if ((long)(now - nextBeepAt[side]) < 0) return;
+  if ((long)(now - toneEndsAt) < 0) return;
+
+  tone(buzzerPin[side], zonePitchHz[zone] + sidePitchShiftHz[side],
+       zoneBeepMs[zone]);
+  toneEndsAt       = now + zoneBeepMs[zone] + 5;
+  nextBeepAt[side] = now + zonePeriodMs[zone];
+}
+
+
+/* LED: steady ON when an object is found, OFF when clear. */
+void updateLed(int zone) {
+  if (zone == ZONE_CLEAR) {
+    digitalWrite(LED_PIN, LOW);
+  } else {
+    digitalWrite(LED_PIN, HIGH);
+  }
+}
+
+
+void setup(void) {
+  int side;
+
+  Serial.begin(9600);
+  Serial.println("=== DRISHTEC obstacle alert cap ===");
+
+  for (side = LEFT; side <= RIGHT; side++) {
+    pinMode(trigPin[side], OUTPUT);
+    pinMode(echoPin[side], INPUT);
+    pinMode(buzzerPin[side], OUTPUT);
+  }
+  pinMode(LED_PIN, OUTPUT);
+
+  calibrateGround();                         /* 5 seconds, LED blinking */
+
+  /* self-test beeps: LEFT then RIGHT */
+  for (side = LEFT; side <= RIGHT; side++) {
+    tone(buzzerPin[side], 1500 + sidePitchShiftHz[side], 150);
+    delay(300);
+  }
+  Serial.println("Ready. Hold an object in front of a sensor.");
+}
+
+
+void loop(void) {
+  unsigned long now;
+  int zone;
+  int leftZone, rightZone, nearestZone;
+
+  /* 1. Take turns pinging */
+  now = millis();
+  if (now - lastPingAt >= PING_GAP_MS) {
+    lastPingAt = now;
+    distanceCm[sensorTurn] = readDistanceCm(sensorTurn);
+    zone = zoneFor(distanceCm[sensorTurn], sensorTurn);
+
+    if (zone == ZONE_CLEAR) {
+      hitCount[sensorTurn] = 0;
+    } else if (hitCount[sensorTurn] < CONFIRM_HITS) {
+      hitCount[sensorTurn]++;
+    }
+
+    report(sensorTurn, distanceCm[sensorTurn], zone);
+    sensorTurn = (sensorTurn == LEFT) ? RIGHT : LEFT;
+  }
+
+  /* 2. Confirmed zone of each side and the nearest one */
+  leftZone    = activeZone(LEFT);
+  rightZone   = activeZone(RIGHT);
+  nearestZone = (leftZone > rightZone) ? leftZone : rightZone;
+
+  /* 3. Beep */
+  now = millis();
+  beepIfDue(LEFT,  leftZone,  now);
+  beepIfDue(RIGHT, rightZone, now);
+
+  /* 4. LED steady ON if object found */
+  updateLed(nearestZone);
+}
